@@ -102,6 +102,8 @@ class MigrationConfig:
     close_session_on_finish: bool
 
     ddl_output_path: str
+    ddl_batch_size: int = 50
+    verify_migration: bool = True
 
     @property
     def livy_base(self) -> str:
@@ -161,6 +163,11 @@ class MigrationConfig:
                 os.getenv("CLOSE_SESSION_ON_FINISH", "true"), default=True
             ),
             ddl_output_path=os.getenv("DDL_OUTPUT_PATH", "migration_ddls.sql"),
+            ddl_batch_size=int(os.getenv("DDL_BATCH_SIZE", os.getenv("BATCH_SIZE", "50"))),
+            verify_migration=parse_bool(
+                os.getenv("VERIFY_MIGRATION", os.getenv("VERIFY_SCHEMAS", "true")),
+                default=True,
+            ),
         )
 
 
@@ -387,15 +394,211 @@ class FabricLivyClient:
                 )
             time.sleep(self.config.poll_interval_seconds)
 
-    def run_sql_statements(self, statements: list[str]) -> list[tuple[str, str]]:
-        """Execute statements one by one so a single failure doesn't abort the rest; returns failures."""
+    def run_sql_statements(
+        self, statements: list[str], batch_size: int = 50
+    ) -> list[tuple[str, str]]:
+        """Execute statements in batches inside Spark to minimize Livy overhead.
+
+        If a batch fails at the Livy statement level, it falls back to
+        executing statements one by one. Individual statement failures inside
+        Spark are caught and collected.
+        """
+        if not statements:
+            return []
+
         failures: list[tuple[str, str]] = []
-        for stmt in statements:
+        total = len(statements)
+
+        for i in range(0, total, batch_size):
+            chunk = statements[i : i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (total + batch_size - 1) // batch_size
+            logger.info(
+                "Executing statement batch %d/%d (%d statements)...",
+                batch_num,
+                total_batches,
+                len(chunk),
+            )
             try:
-                self.run_statement(f"spark.sql({json.dumps(stmt)})")
-            except Exception as exc:  # noqa: BLE001 - collect and continue
-                failures.append((stmt, str(exc)))
+                chunk_failures = self._run_sql_batch(chunk)
+                failures.extend(chunk_failures)
+            except Exception as exc:
+                logger.warning(
+                    "Batch %d failed with error (%s). Falling back to sequential execution for this batch...",
+                    batch_num,
+                    exc,
+                )
+                for stmt in chunk:
+                    try:
+                        self.run_statement(f"spark.sql({json.dumps(stmt)})")
+                    except Exception as stmt_exc:  # noqa: BLE001 - collect and continue
+                        failures.append((stmt, str(stmt_exc)))
+
         return failures
+
+    def _run_sql_batch(self, statements: list[str]) -> list[tuple[str, str]]:
+        stmts_code = ",\n".join(json.dumps(s) for s in statements)
+        code = f"""
+val stmts = Array[String](
+{stmts_code}
+)
+val failures = new scala.collection.mutable.ArrayBuffer[String]()
+for (stmt <- stmts) {{
+  try {{
+    spark.sql(stmt)
+  }} catch {{
+    case e: Throwable =>
+      val msg = if (e.getMessage != null) e.getMessage.replace('\\n', ' ').replace('\\r', ' ').replace("<<<SEP>>>", " ") else e.toString
+      failures += (stmt + "<<<SEP>>>" + msg)
+  }}
+}}
+println("<<<FAILURES_BEGIN>>>" + failures.mkString("<<<ITEM>>>") + "<<<FAILURES_END>>>")
+""".strip()
+
+        output = self.run_statement(code)
+        text = output.get("data", {}).get("text/plain", "")
+        return self._parse_batch_failures(text)
+
+    @staticmethod
+    def _parse_batch_failures(text: str) -> list[tuple[str, str]]:
+        if "<<<FAILURES_BEGIN>>>" not in text or "<<<FAILURES_END>>>" not in text:
+            return []
+        start = text.index("<<<FAILURES_BEGIN>>>") + len("<<<FAILURES_BEGIN>>>")
+        end = text.index("<<<FAILURES_END>>>")
+        content = text[start:end].strip()
+        if not content:
+            return []
+        results: list[tuple[str, str]] = []
+        for item in content.split("<<<ITEM>>>"):
+            item = item.strip()
+            if not item:
+                continue
+            if "<<<SEP>>>" in item:
+                stmt, err = item.split("<<<SEP>>>", 1)
+                results.append((stmt.strip(), err.strip()))
+            else:
+                results.append((item, "Unknown error"))
+        return results
+
+    def run_concurrent_sql_statements(
+        self,
+        statements: list[str],
+        batch_size: int = 10,
+        concurrency: int = 4,
+    ) -> tuple[list[str], list[tuple[str, str]]]:
+        """Execute statements in parallel batches using a thread pool inside Spark.
+
+        Returns (succeeded_statements, failed_statements_with_error).
+        """
+        if not statements:
+            return [], []
+
+        succeeded: list[str] = []
+        failed: list[tuple[str, str]] = []
+        total = len(statements)
+
+        for i in range(0, total, batch_size):
+            chunk = statements[i : i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (total + batch_size - 1) // batch_size
+            logger.info(
+                "Executing concurrent batch %d/%d (%d tables, concurrency=%d)...",
+                batch_num,
+                total_batches,
+                len(chunk),
+                concurrency,
+            )
+            try:
+                chunk_results = self._run_concurrent_sql_batch(chunk, concurrency=concurrency)
+                for stmt, is_success, err in chunk_results:
+                    if is_success:
+                        succeeded.append(stmt)
+                        logger.info("  [SUCCESS] %s", stmt[:120] + ("..." if len(stmt) > 120 else ""))
+                    else:
+                        failed.append((stmt, err))
+                        logger.error("  [FAILED] %s -> %s", stmt[:120] + ("..." if len(stmt) > 120 else ""), err)
+            except Exception as exc:
+                logger.warning(
+                    "Concurrent batch %d failed (%s). Falling back to sequential execution for this chunk...",
+                    batch_num,
+                    exc,
+                )
+                for stmt in chunk:
+                    try:
+                        self.run_statement(f"spark.sql({json.dumps(stmt)})")
+                        succeeded.append(stmt)
+                        logger.info("  [SUCCESS] %s", stmt[:120] + ("..." if len(stmt) > 120 else ""))
+                    except Exception as stmt_exc:
+                        failed.append((stmt, str(stmt_exc)))
+                        logger.error("  [FAILED] %s -> %s", stmt[:120] + ("..." if len(stmt) > 120 else ""), stmt_exc)
+
+        return succeeded, failed
+
+    def _run_concurrent_sql_batch(
+        self, statements: list[str], concurrency: int = 4
+    ) -> list[tuple[str, bool, str]]:
+        stmts_code = ",\n".join(json.dumps(s) for s in statements)
+        code = f"""
+val stmts = Array[String](
+{stmts_code}
+)
+val pool = java.util.concurrent.Executors.newFixedThreadPool({concurrency})
+implicit val ec = scala.concurrent.ExecutionContext.fromExecutor(pool)
+
+val futures = stmts.map {{ stmt =>
+  scala.concurrent.Future {{
+    try {{
+      spark.sql(stmt)
+      (stmt, "SUCCESS")
+    }} catch {{
+      case e: Throwable =>
+        val msg = if (e.getMessage != null) e.getMessage.replace('\\n', ' ').replace('\\r', ' ') else e.toString
+        (stmt, "ERROR:::" + msg)
+    }}
+  }}
+}}
+
+val results = scala.concurrent.Await.result(
+  scala.concurrent.Future.sequence(futures.toSeq),
+  scala.concurrent.duration.Duration.Inf
+)
+pool.shutdown()
+
+val out = results.map {{ case (stmt, status) => stmt + "<<<SEP>>>" + status }}
+println("<<<CONCURRENT_RESULTS_BEGIN>>>" + out.mkString("<<<ITEM>>>") + "<<<CONCURRENT_RESULTS_END>>>")
+""".strip()
+
+        output = self.run_statement(code)
+        text = output.get("data", {}).get("text/plain", "")
+        return self._parse_concurrent_results(text)
+
+    @staticmethod
+    def _parse_concurrent_results(text: str) -> list[tuple[str, bool, str]]:
+        if "<<<CONCURRENT_RESULTS_BEGIN>>>" not in text or "<<<CONCURRENT_RESULTS_END>>>" not in text:
+            return []
+        start = text.index("<<<CONCURRENT_RESULTS_BEGIN>>>") + len("<<<CONCURRENT_RESULTS_BEGIN>>>")
+        end = text.index("<<<CONCURRENT_RESULTS_END>>>")
+        content = text[start:end].strip()
+        if not content:
+            return []
+        results: list[tuple[str, bool, str]] = []
+        for item in content.split("<<<ITEM>>>"):
+            item = item.strip()
+            if not item:
+                continue
+            if "<<<SEP>>>" in item:
+                stmt, status = item.split("<<<SEP>>>", 1)
+                stmt = stmt.strip()
+                status = status.strip()
+                if status == "SUCCESS":
+                    results.append((stmt, True, ""))
+                elif status.startswith("ERROR:::"):
+                    results.append((stmt, False, status[len("ERROR:::"):].strip()))
+                else:
+                    results.append((stmt, False, status))
+            else:
+                results.append((item, False, "Unknown format"))
+        return results
 
     def list_schemas(self) -> set[str]:
         """Query Fabric for schemas that actually exist, to confirm creation before table DDL runs."""
@@ -409,6 +612,70 @@ class FabricLivyClient:
         code = f'println(spark.sql({show_tables}).collect().map(_.getString(1)).mkString("|||"))'
         output = self.run_statement(code)
         return split_delimited_output(output.get("data", {}).get("text/plain", ""))
+
+    def verify_all(
+        self, schemas: list[str]
+    ) -> tuple[set[str], dict[str, set[str]], list[str]]:
+        """Verify schemas and tables across multiple schemas in a single Spark statement."""
+        if not schemas:
+            return set(), {}, []
+        schemas_code = ",\n".join(json.dumps(s) for s in schemas)
+        code = f"""
+val reqSchemas = Array[String](
+{schemas_code}
+)
+val existingSchemas = spark.sql("SHOW SCHEMAS").collect().map(_.getString(0)).map(s => if (s.contains(".")) s.substring(s.lastIndexOf(".") + 1) else s).mkString("|||")
+val tables = new scala.collection.mutable.ArrayBuffer[String]()
+for (s <- reqSchemas) {{
+  try {{
+    val safeSchema = s.replace("`", "``")
+    val tbls = spark.sql("SHOW TABLES IN `" + safeSchema + "`").collect().map(_.getString(1))
+    for (t <- tbls) {{
+      tables += (s + ":::" + t)
+    }}
+  }} catch {{
+    case e: Throwable =>
+      val msg = if (e.getMessage != null) e.getMessage.replace('\\n', ' ') else e.toString
+      tables += ("__ERROR__:::" + s + ":::" + msg)
+  }}
+}}
+println("<<<SCHEMAS_BEGIN>>>" + existingSchemas + "<<<SCHEMAS_END>>>")
+println("<<<TABLES_BEGIN>>>" + tables.mkString("|||") + "<<<TABLES_END>>>")
+""".strip()
+        output = self.run_statement(code)
+        text = output.get("data", {}).get("text/plain", "")
+        return self._parse_verify_all(text)
+
+    @staticmethod
+    def _parse_verify_all(
+        text: str,
+    ) -> tuple[set[str], dict[str, set[str]], list[str]]:
+        schemas: set[str] = set()
+        if "<<<SCHEMAS_BEGIN>>>" in text and "<<<SCHEMAS_END>>>" in text:
+            s_start = text.index("<<<SCHEMAS_BEGIN>>>") + len("<<<SCHEMAS_BEGIN>>>")
+            s_end = text.index("<<<SCHEMAS_END>>>")
+            s_content = text[s_start:s_end].strip()
+            if s_content:
+                schemas = {s.strip() for s in s_content.split("|||") if s.strip()}
+
+        tables_map: dict[str, set[str]] = defaultdict(set)
+        errors: list[str] = []
+        if "<<<TABLES_BEGIN>>>" in text and "<<<TABLES_END>>>" in text:
+            t_start = text.index("<<<TABLES_BEGIN>>>") + len("<<<TABLES_BEGIN>>>")
+            t_end = text.index("<<<TABLES_END>>>")
+            t_content = text[t_start:t_end].strip()
+            if t_content:
+                for item in t_content.split("|||"):
+                    item = item.strip()
+                    if not item:
+                        continue
+                    if item.startswith("__ERROR__:::"):
+                        errors.append(item.replace("__ERROR__:::", "", 1))
+                    elif ":::" in item:
+                        sch, tbl = item.split(":::", 1)
+                        tables_map[sch.strip()].add(tbl.strip())
+
+        return schemas, dict(tables_map), errors
 
 
 # ------------------------------
@@ -492,45 +759,54 @@ def verify_migration(
     fabric: FabricLivyClient, table_defs: list[TableDef], config: MigrationConfig, check_tables: bool
 ) -> None:
     """Re-poll Fabric until every expected schema/table is actually visible, tolerating creation delay."""
+    if not config.verify_migration:
+        logger.info("Verification skipped (VERIFY_MIGRATION/VERIFY_SCHEMAS=false)")
+        return
+
     tables_by_schema: dict[str, set[str]] = defaultdict(set)
     for entry in table_defs:
         tables_by_schema[entry["schema"]].add(entry["table"])
     required_schemas = sorted(tables_by_schema)
 
-    # range(1, max_retries + 2) always yields at least one attempt, so these are set before use.
-    missing_schemas: set[str]
-    missing_tables: dict[str, set[str]]
+    missing_schemas: set[str] = set()
+    missing_tables: dict[str, set[str]] = {}
 
     for attempt in range(1, config.max_retries + 2):
-        existing_schemas = {name.rsplit(".", 1)[-1] for name in fabric.list_schemas()}
-        missing_schemas = set(required_schemas) - existing_schemas
+        try:
+            existing_schemas, tables_map, errors = fabric.verify_all(required_schemas)
+            for err in errors:
+                logger.warning("Fabric verification check issue: %s", err)
 
-        missing_tables = {}
-        if check_tables:
-            for schema in required_schemas:
-                if schema in missing_schemas:
-                    continue
-                still_missing = tables_by_schema[schema] - fabric.list_tables(schema)
-                if still_missing:
-                    missing_tables[schema] = still_missing
+            missing_schemas = set(required_schemas) - existing_schemas
+            missing_tables = {}
+            if check_tables:
+                for schema in required_schemas:
+                    if schema in missing_schemas:
+                        continue
+                    still_missing = tables_by_schema[schema] - tables_map.get(schema, set())
+                    if still_missing:
+                        missing_tables[schema] = still_missing
 
-        if not missing_schemas and not missing_tables:
-            logger.info(
-                "Verification passed: %d schema(s)%s confirmed in Fabric",
-                len(required_schemas),
-                f" and {sum(len(v) for v in tables_by_schema.values())} table(s)" if check_tables else "",
+            if not missing_schemas and not missing_tables:
+                logger.info(
+                    "Verification passed: %d schema(s)%s confirmed in Fabric",
+                    len(required_schemas),
+                    f" and {sum(len(v) for v in tables_by_schema.values())} table(s)" if check_tables else "",
+                )
+                return
+        except Exception as exc:
+            logger.warning("Verification check failed (%s)", exc)
+
+        if attempt < config.max_retries + 1:
+            logger.warning(
+                "Verification attempt %d/%d: %d schema(s) and %d table(s) not yet visible, retrying in %.1fs...",
+                attempt,
+                config.max_retries + 1,
+                len(missing_schemas),
+                sum(len(v) for v in missing_tables.values()),
+                config.retry_backoff_seconds,
             )
-            return
-
-        logger.warning(
-            "Verification attempt %d/%d: %d schema(s) and %d table(s) not yet visible, retrying in %.1fs...",
-            attempt,
-            config.max_retries + 1,
-            len(missing_schemas),
-            sum(len(v) for v in missing_tables.values()),
-            config.retry_backoff_seconds,
-        )
-        time.sleep(config.retry_backoff_seconds * attempt)
+            time.sleep(config.retry_backoff_seconds * attempt)
 
     if missing_schemas:
         logger.error("Schemas still missing after verification: %s", ", ".join(sorted(missing_schemas)))
@@ -569,7 +845,7 @@ def migrate() -> None:
     try:
         if config.execute_schema_creation:
             logger.info("[5/6] Creating schemas in Fabric...")
-            failures = fabric.run_sql_statements(schema_stmts)
+            failures = fabric.run_sql_statements(schema_stmts, batch_size=config.ddl_batch_size)
             for stmt, err in failures:
                 logger.error("Schema creation failed: %s -> %s", stmt, err)
             succeeded = len(schema_stmts) - len(failures)
@@ -598,7 +874,7 @@ def migrate() -> None:
             ready_table_stmts = build_table_create_statements(ready_table_defs)
 
             logger.info("[6/6] Creating tables in Fabric...")
-            failures = fabric.run_sql_statements(ready_table_stmts)
+            failures = fabric.run_sql_statements(ready_table_stmts, batch_size=config.ddl_batch_size)
             for stmt, err in failures:
                 logger.error("Table creation failed: %s -> %s", stmt, err)
             succeeded = len(ready_table_stmts) - len(failures)

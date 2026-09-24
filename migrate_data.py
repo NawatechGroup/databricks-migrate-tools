@@ -67,9 +67,9 @@ def fetch_table_locations(dbr: DatabricksClient, config: MigrationConfig) -> lis
         WHERE
             table_catalog IN ({catalogs})
             AND table_schema NOT IN ({schema_exclude})
-            AND table_schema = '{config.schema_include}'
+            AND (table_schema = '{config.schema_include}')
             AND table_name NOT REGEXP '{config.table_exclude_regexp}'
-            AND table_type = 'MANAGED'
+            AND table_type IN ('MANAGED')
         ORDER BY table_catalog, table_schema, table_name
 """.strip()
 
@@ -77,9 +77,17 @@ def fetch_table_locations(dbr: DatabricksClient, config: MigrationConfig) -> lis
 
 
 def build_insert_statement(schema: str, table: str, delta_files_path: str, mode: str) -> str:
-    verb = _INSERT_VERBS.get(mode.upper(), _INSERT_VERBS["INTO"])
+    normalized = mode.strip().upper().replace(" ", "_")
     target = f"{quote_identifier(schema)}.{quote_identifier(table)}"
-    return f"{verb} {target} SELECT * FROM DELTA.`{delta_files_path}`"
+    source = f"DELTA.`{delta_files_path}`"
+
+    if normalized in {"SHALLOW", "SHALLOW_CLONE"}:
+        return f"CREATE OR REPLACE TABLE {target} SHALLOW CLONE {source}"
+    if normalized in {"DEEP", "DEEP_CLONE", "CLONE"}:
+        return f"CREATE OR REPLACE TABLE {target} DEEP CLONE {source}"
+    if normalized == "OVERWRITE":
+        return f"INSERT OVERWRITE {target} SELECT * FROM {source}"
+    return f"INSERT INTO {target} SELECT * FROM {source}"
 
 
 def _timestamped_path(path: str) -> str:
@@ -124,20 +132,21 @@ def migrate() -> None:
     succeeded: list[str] = []
     failed: list[tuple[str, str]] = []
 
+    batch_size = int(os.getenv("DATA_MIGRATE_BATCH_SIZE", os.getenv("BATCH_SIZE", "10")))
+    concurrency = int(os.getenv("DATA_MIGRATE_CONCURRENCY", os.getenv("CONCURRENCY", "4")))
+
     if execute_insert:
-        logger.info("[4/4] Executing INSERT statements in Fabric...")
+        logger.info(
+            "[4/4] Executing migration statements in Fabric (batch_size=%d, concurrency=%d)...",
+            batch_size,
+            concurrency,
+        )
         fabric = FabricLivyClient(config)
         fabric.start_session()
         try:
-            for index, stmt in enumerate(statements, start=1):
-                progress = f"[{index}/{len(statements)}]"
-                logger.info("%s Running: %s", progress, stmt)
-                failures = fabric.run_sql_statements([stmt])
-                if failures:
-                    failed.append((stmt, failures[0][1]))
-                    logger.error("%s FAILED: %s", progress, failures[0][1])
-                else:
-                    succeeded.append(stmt)
+            succeeded, failed = fabric.run_concurrent_sql_statements(
+                statements, batch_size=batch_size, concurrency=concurrency
+            )
         finally:
             if config.close_session_on_finish:
                 logger.info("Closing Fabric session...")
