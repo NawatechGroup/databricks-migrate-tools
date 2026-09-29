@@ -1,0 +1,14 @@
+Waerebo_Source_Daily_Job_02
+Astra_Source_Daily_Job_02
+Maros_Source_Daily_Job_02
+Daya_Source_Daily_Job_02
+
+Solok_Source_Waerebo_Job_02
+Solok_Source_Astra_Job_02
+Solok_Source_Maros_Job_02
+Solok_Source_Daya_Job_02
+
+Whiteoak_Details_Daily_Job_00
+Arborvitae_Details_Daily_Job_00
+Magnolia_Details_Daily_Job_00
+Douglasfir_Details_Daily_Job_00

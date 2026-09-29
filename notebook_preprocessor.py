@@ -122,19 +122,42 @@ def _injected_parameter_cells(is_sql_notebook: bool, include_auto_merge: bool) -
         "main_dealer_id     = 1\n"
         "# COMMAND ----------\n"
     )
+    config = "spark.conf.set('spark.sql.parser.quotedRegexColumnNames', 'true')\n"
+
+    if include_auto_merge:
+            config += "spark.conf.set('spark.databricks.delta.schema.autoMerge.enabled', 'true')\n"
+
     if is_sql_notebook:
-        config = (
+        config += (
             "spark.conf.set(\"year\", str(year))\n"
             "spark.conf.set(\"month\", str(month))\n"
             "spark.conf.set(\"day\", str(day))\n"
             "spark.conf.set(\"folder_identifier\", str(folder_identifier))\n"
             "spark.conf.set(\"payload_filter\", payload_filter)\n"
         )
-    else:
-        config = "spark.conf.set('spark.sql.parser.quotedRegexColumnNames', 'true')\n"
-    if include_auto_merge:
-        config += "spark.conf.set('spark.databricks.delta.schema.autoMerge.enabled', 'true')\n"
     return parameters + config + "# COMMAND ----------\n"
+
+
+_USE_OR_MERGE_PATTERN = re.compile(
+    r"(?im)(?:^[ \t]*|[\"'])USE\s+(?!CATALOG\b)(?:(?:SCHEMA|DATABASE)\s+)?(?P<schema>`?\w+`?)(?=\s*(?:[\"';]|$))"
+    r"|\bMERGE\s+INTO\s+(?P<table>`?\w+`?)(?=\s)"
+)
+
+
+def qualify_merge_targets_with_schema(source_text: str) -> str:
+    """Rewrite `MERGE INTO t` to `MERGE INTO <schema>.t` using the most recent USE <schema>."""
+    current_schema: Optional[str] = None
+
+    def _replace(match: re.Match) -> str:
+        nonlocal current_schema
+        if match.group("schema"):
+            current_schema = match.group("schema")
+            return match.group(0)
+        if current_schema is None:
+            return match.group(0)
+        return match.group(0)[: match.start("table") - match.start()] + f"{current_schema}.{match.group('table')}"
+
+    return _USE_OR_MERGE_PATTERN.sub(_replace, source_text)
 
 
 def _replace_magic_command(line: str, replacements: dict) -> str:
@@ -202,6 +225,9 @@ def preprocess_databricks_source(
             transformed,
             flags=re.IGNORECASE,
         )
+
+    # must run before USE lines are commented out below
+    transformed = qualify_merge_targets_with_schema(transformed)
 
     if magic_command_replacements:
         transformed = "\n".join(

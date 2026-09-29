@@ -19,15 +19,19 @@ Usage:
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -101,31 +105,114 @@ DEFAULT_LAKEHOUSE = {
     "workspace_id": FABRIC_WORKSPACE_ID,
 }
 
+DEFAULT_TIMEOUT = (
+    float(os.getenv("HTTP_CONNECT_TIMEOUT", "15")),
+    float(os.getenv("HTTP_READ_TIMEOUT", "60")),
+)
+HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))
+HTTP_RETRY_BACKOFF = float(os.getenv("HTTP_RETRY_BACKOFF", "2.0"))
+NOTEBOOK_MIGRATE_CONCURRENCY = int(
+    os.getenv("NOTEBOOK_MIGRATE_CONCURRENCY", os.getenv("CONCURRENCY", "4"))
+)
+
+
+# ---------------------------------------------------------------------------
+# HTTP Helpers (Resilience, Timeouts, Keep-Alive Connection Pooling)
+# ---------------------------------------------------------------------------
+
+def create_session(pool_size: int = 20) -> requests.Session:
+    session = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def request_with_retry(
+    session: requests.Session,
+    method: str,
+    url: str,
+    max_retries: int = HTTP_MAX_RETRIES,
+    backoff_seconds: float = HTTP_RETRY_BACKOFF,
+    timeout: tuple[float, float] = DEFAULT_TIMEOUT,
+    **kwargs: Any,
+) -> requests.Response:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            response = session.request(method, url, timeout=timeout, **kwargs)
+        except (requests.exceptions.RequestException, ConnectionResetError) as exc:
+            if attempt > max_retries:
+                raise
+            logger.warning(
+                "Transient network error on %s %s (attempt %d/%d): %s. Retrying in %.1fs...",
+                method, url, attempt, max_retries, exc, backoff_seconds * attempt,
+            )
+            time.sleep(backoff_seconds * attempt)
+            continue
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            wait_time = float(retry_after) if retry_after and retry_after.isdigit() else backoff_seconds * attempt
+            if attempt > max_retries:
+                return response
+            logger.warning("Rate limited (HTTP 429) on %s %s. Waiting %.1fs...", method, url, wait_time)
+            time.sleep(wait_time)
+            continue
+
+        if response.status_code >= 500:
+            if attempt > max_retries:
+                return response
+            logger.warning(
+                "Transient HTTP %d on %s %s (attempt %d/%d). Retrying in %.1fs...",
+                response.status_code, method, url, attempt, max_retries, backoff_seconds * attempt,
+            )
+            time.sleep(backoff_seconds * attempt)
+            continue
+
+        return response
+
 
 # ---------------------------------------------------------------------------
 # Databricks export
 # ---------------------------------------------------------------------------
 
-def list_all_notebooks(path: str = "/") -> list[dict]:
-    resp = requests.get(
+def list_all_notebooks(session: requests.Session, path: str = "/") -> list[dict]:
+    resp = request_with_retry(
+        session,
+        "GET",
         f"{DATABRICKS_HOST}/api/2.0/workspace/list",
-        headers=DATABRICKS_HEADERS, params={"path": path},
-    ).json()
+        headers=DATABRICKS_HEADERS,
+        params={"path": path},
+    )
+    resp.raise_for_status()
+    data = resp.json()
     items: list[dict] = []
-    for obj in resp.get("objects", []):
+    for obj in data.get("objects", []):
         if obj["object_type"] == "DIRECTORY":
-            items.extend(list_all_notebooks(obj["path"]))
+            items.extend(list_all_notebooks(session, obj["path"]))
         elif obj["object_type"] == "NOTEBOOK":
             items.append(obj)
     return items
 
 
-def export_notebook(path: str) -> str:
-    resp = requests.get(
+def export_notebook(session: requests.Session, path: str) -> str:
+    resp = request_with_retry(
+        session,
+        "GET",
         f"{DATABRICKS_HOST}/api/2.0/workspace/export",
-        headers=DATABRICKS_HEADERS, params={"path": path, "format": "SOURCE"},
-    ).json()
-    return base64.b64decode(resp["content"]).decode("utf-8")
+        headers=DATABRICKS_HEADERS,
+        params={"path": path, "format": "SOURCE"},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "content" not in data:
+        raise RuntimeError(f"Databricks export response missing 'content': {data}")
+    return base64.b64decode(data["content"]).decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -223,16 +310,22 @@ def convert_databricks_source_to_ipynb(source_text: str, notebook_name: str, lak
 # Fabric API
 # ---------------------------------------------------------------------------
 
-def list_all_folders() -> list[dict]:
-    resp = requests.get(
+_folder_lock = threading.Lock()
+
+
+def list_all_folders(session: requests.Session) -> list[dict]:
+    resp = request_with_retry(
+        session,
+        "GET",
         f"{FABRIC_API_BASE}/workspaces/{FABRIC_WORKSPACE_ID}/folders",
         headers=FABRIC_HEADERS,
-    ).json()
-    return resp.get("value", [])
+    )
+    resp.raise_for_status()
+    return resp.json().get("value", [])
 
 
-def build_folder_map_from_existing() -> dict:
-    folders = list_all_folders()
+def build_folder_map_from_existing(session: requests.Session) -> dict[str, str]:
+    folders = list_all_folders(session)
     id_to_folder = {f["id"]: f for f in folders}
 
     def resolve_path(folder_id: str) -> str:
@@ -245,35 +338,46 @@ def build_folder_map_from_existing() -> dict:
     return {resolve_path(f["id"]): f["id"] for f in folders}
 
 
-def get_or_create_folder(folder_path: str, folder_id_map: dict) -> Optional[str]:
-    if folder_path in folder_id_map:
-        return folder_id_map[folder_path]
+def get_or_create_folder(
+    session: requests.Session, folder_path: str, folder_id_map: dict[str, str]
+) -> Optional[str]:
+    with _folder_lock:
+        if folder_path in folder_id_map:
+            return folder_id_map[folder_path]
 
-    parts = folder_path.strip("/").split("/")
-    parent_id = None
-    current_path = ""
-    for part in parts:
-        current_path += "/" + part
-        if current_path in folder_id_map:
-            parent_id = folder_id_map[current_path]
-            continue
-        body = {"displayName": part}
-        if parent_id:
-            body["parentFolderId"] = parent_id
-        resp = requests.post(
-            f"{FABRIC_API_BASE}/workspaces/{FABRIC_WORKSPACE_ID}/folders",
-            headers=FABRIC_HEADERS, json=body,
-        ).json()
-        parent_id = resp["id"]
-        folder_id_map[current_path] = parent_id
-    return parent_id
+        parts = folder_path.strip("/").split("/")
+        parent_id = None
+        current_path = ""
+        for part in parts:
+            current_path += "/" + part
+            if current_path in folder_id_map:
+                parent_id = folder_id_map[current_path]
+                continue
+            body: dict[str, Any] = {"displayName": part}
+            if parent_id:
+                body["parentFolderId"] = parent_id
+            resp = request_with_retry(
+                session,
+                "POST",
+                f"{FABRIC_API_BASE}/workspaces/{FABRIC_WORKSPACE_ID}/folders",
+                headers=FABRIC_HEADERS,
+                json=body,
+            )
+            resp.raise_for_status()
+            parent_id = resp.json()["id"]
+            folder_id_map[current_path] = parent_id
+        return parent_id
 
 
-def create_fabric_notebook(display_name: str, folder_id: Optional[str], ipynb_content_str: str) -> requests.Response:
+def create_fabric_notebook(
+    session: requests.Session,
+    display_name: str,
+    folder_id: Optional[str],
+    ipynb_content_str: str,
+) -> requests.Response:
     content_b64 = base64.b64encode(ipynb_content_str.encode("utf-8")).decode("utf-8")
-    body = {
+    body: dict[str, Any] = {
         "displayName": display_name,
-        "folderId": folder_id,
         "definition": {
             "format": "ipynb",
             "parts": [
@@ -285,15 +389,65 @@ def create_fabric_notebook(display_name: str, folder_id: Optional[str], ipynb_co
             ],
         },
     }
-    return requests.post(
+    if folder_id:
+        body["folderId"] = folder_id
+
+    return request_with_retry(
+        session,
+        "POST",
         f"{FABRIC_API_BASE}/workspaces/{FABRIC_WORKSPACE_ID}/notebooks",
-        headers=FABRIC_HEADERS, json=body,
+        headers=FABRIC_HEADERS,
+        json=body,
     )
 
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+
+def _migrate_single_notebook(
+    session: requests.Session,
+    nb: dict,
+    folder_id_map: dict[str, str],
+    preprocess: bool,
+    progress: str,
+) -> tuple[str, bool, str]:
+    folder_path = "/".join(nb["path"].split("/")[:-1])
+    notebook_name = nb["path"].split("/")[-1]
+
+    try:
+        logger.info("%s Migrating: %s", progress, nb["path"])
+
+        folder_id = folder_id_map.get(folder_path) or get_or_create_folder(session, folder_path, folder_id_map)
+        raw_source = export_notebook(session, nb["path"])
+
+        if preprocess:
+            assert preprocess_notebook is not None  # guaranteed by the guard above
+            raw_source = preprocess_notebook(
+                raw_source,
+                notebook_name,
+                line_comment_patterns=COMMENT_OUT_PATTERNS,
+                inject_parameters_cell=True,
+                rewrite_raw_to_parquet=True,
+            )
+
+        ipynb_content = convert_databricks_source_to_ipynb(
+            raw_source, notebook_name, lakehouse=DEFAULT_LAKEHOUSE
+        )
+
+        result = create_fabric_notebook(session, notebook_name, folder_id, ipynb_content)
+
+        if result.status_code >= 400:
+            err_msg = f"HTTP {result.status_code}: {result.text}"
+            logger.error("%s FAILED: %s -> %s", progress, notebook_name, err_msg)
+            return nb["path"], False, err_msg
+
+        logger.info("%s OK: %s -> %d", progress, notebook_name, result.status_code)
+        return nb["path"], True, ""
+    except Exception as exc:  # noqa: BLE001 - report and continue with remaining notebooks
+        logger.exception("%s FAILED: %s raised an exception: %s", progress, notebook_name, exc)
+        return nb["path"], False, str(exc)
+
 
 def migrate_all_notebooks(notebook_path: str = DATABRICKS_NOTEBOOK_PATH, preprocess: bool = True) -> None:
     """Migrate every Databricks notebook under `notebook_path` into Fabric.
@@ -307,10 +461,13 @@ def migrate_all_notebooks(notebook_path: str = DATABRICKS_NOTEBOOK_PATH, preproc
             "Place notebook_preprocessor.py next to migrate_notebook.py, or call with preprocess=False."
         )
 
+    concurrency = max(1, NOTEBOOK_MIGRATE_CONCURRENCY)
+    session = create_session(pool_size=max(20, concurrency * 4))
+
     start_time = time.monotonic()
 
     logger.info("Listing notebooks under Databricks path: %s", notebook_path)
-    notebooks = list_all_notebooks(notebook_path)
+    notebooks = list_all_notebooks(session, notebook_path)
     logger.info("Found %d notebook(s) total", len(notebooks))
 
     filtered_notebooks = [
@@ -325,54 +482,50 @@ def migrate_all_notebooks(notebook_path: str = DATABRICKS_NOTEBOOK_PATH, preproc
     logger.info("Preprocessing is %s", "ENABLED" if preprocess else "DISABLED (migrating as-is)")
 
     logger.info("Fetching existing Fabric folder structure")
-    folder_id_map = build_folder_map_from_existing()
+    folder_id_map = build_folder_map_from_existing(session)
+
+    # Pre-resolve and pre-create required folders upfront so workers never collide
+    distinct_folders = sorted({"/".join(nb["path"].split("/")[:-1]) for nb in filtered_notebooks})
+    for fp in distinct_folders:
+        if fp:
+            get_or_create_folder(session, fp, folder_id_map)
 
     succeeded: list[str] = []
     failed: list[tuple[str, str]] = []
 
-    for index, nb in enumerate(filtered_notebooks, start=1):
-        folder_path = "/".join(nb["path"].split("/")[:-1])
-        notebook_name = nb["path"].split("/")[-1]
-        progress = f"[{index}/{len(filtered_notebooks)}]"
+    logger.info("Starting notebook migration (concurrency=%d)...", concurrency)
 
-        try:
-            logger.info("%s Migrating: %s", progress, nb["path"])
-
-            logger.debug("%s Resolving/creating folder: %s", progress, folder_path)
-            folder_id = get_or_create_folder(folder_path, folder_id_map)
-
-            logger.debug("%s Exporting source from Databricks", progress)
-            raw_source = export_notebook(nb["path"])
-
-            if preprocess:
-                assert preprocess_notebook is not None  # guaranteed by the guard above
-                _preprocess = preprocess_notebook
-                logger.debug("%s Applying preprocessing rules", progress)
-                raw_source = _preprocess(
-                    raw_source,
-                    notebook_name,
-                    line_comment_patterns=COMMENT_OUT_PATTERNS,
-                    inject_parameters_cell=True,
-                    rewrite_raw_to_parquet=True,
+    if concurrency > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {}
+            for index, nb in enumerate(filtered_notebooks, start=1):
+                progress = f"[{index}/{len(filtered_notebooks)}]"
+                fut = executor.submit(
+                    _migrate_single_notebook,
+                    session,
+                    nb,
+                    folder_id_map,
+                    preprocess,
+                    progress,
                 )
+                futures[fut] = nb["path"]
 
-            logger.debug("%s Converting to Fabric .ipynb format", progress)
-            ipynb_content = convert_databricks_source_to_ipynb(
-                raw_source, notebook_name, lakehouse=DEFAULT_LAKEHOUSE
+            for fut in as_completed(futures):
+                path, is_success, msg = fut.result()
+                if is_success:
+                    succeeded.append(path)
+                else:
+                    failed.append((path, msg))
+    else:
+        for index, nb in enumerate(filtered_notebooks, start=1):
+            progress = f"[{index}/{len(filtered_notebooks)}]"
+            path, is_success, msg = _migrate_single_notebook(
+                session, nb, folder_id_map, preprocess, progress
             )
-
-            logger.debug("%s Creating notebook in Fabric", progress)
-            result = create_fabric_notebook(notebook_name, folder_id, ipynb_content)
-
-            if result.status_code >= 400:
-                failed.append((nb["path"], f"HTTP {result.status_code}: {result.text}"))
-                logger.error("%s FAILED: %s -> %d %s", progress, notebook_name, result.status_code, result.text)
+            if is_success:
+                succeeded.append(path)
             else:
-                succeeded.append(nb["path"])
-                logger.info("%s OK: %s -> %d", progress, notebook_name, result.status_code)
-        except Exception as exc:  # noqa: BLE001 - report and continue with remaining notebooks
-            failed.append((nb["path"], str(exc)))
-            logger.exception("%s FAILED: %s raised an exception", progress, notebook_name)
+                failed.append((path, msg))
 
     elapsed = time.monotonic() - start_time
     logger.info("=" * 60)

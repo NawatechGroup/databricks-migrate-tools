@@ -126,29 +126,32 @@ Key env vars: `DATABRICKS_NOTEBOOK_PATH`, `DATABRICKS_EXCLUDE_PATH_CONTAINS`,
 
 ### 4. Migrate job (Databricks Jobs → Fabric Data Pipelines)
 
-```
+```bash
+# Migrate a single job by exact name or prefix:
 python migrate_job.py "My_Job_Name"
 python migrate_job.py "My_Job_Prefix" --prefix --folder "Test"
+
+# Migrate multiple jobs from a text file:
+python migrate_job.py jobs.txt
+python migrate_job.py --file jobs.txt --folder "Production"
 ```
 
+The text file should contain one job name per line (`#` comments and blank lines are ignored).
+
 Requires the notebooks referenced by the job's tasks to already exist in Fabric
-under the same folder structure (step 3). For a matched job, it:
+(step 3). For matched jobs, it:
 1. Resolves/creates the target Fabric folder (`PIPELINE_TARGET_FOLDER`, default empty/workspace root).
-2. Maps each task's Databricks `notebook_path` to its Fabric notebook ID.
-3. Builds a pipeline definition with one `TridentNotebook` activity per notebook
-   task (respecting `dependsOn` from the original job), skipping non-notebook
-   tasks with a warning.
-4. Creates the pipeline in Fabric — but only if at least one task resolved to an
-   activity; if none did, it logs an error and skips creation instead of creating
-   an empty pipeline.
+2. Maps each task's Databricks `notebook_path` to its Fabric notebook ID (first checks exact folder path, then automatically falls back to searching by notebook name across all folders).
+3. Sanitizes activity names to adhere to Fabric pipeline naming constraints and automatically prunes broken dependencies.
+4. Creates the pipeline in Fabric with full auto-retry and timeout protection.
 
 Can also be used as a library:
 ```python
-from migrate_job import migrate_databricks_job_to_fabric_pipeline
-migrate_databricks_job_to_fabric_pipeline("My_Job_Name", folder_path="")
+from migrate_job import migrate_databricks_jobs
+migrate_databricks_jobs(["My_Job_1", "My_Job_2"], folder_path="")
 ```
 
-Key env vars: `PIPELINE_TARGET_FOLDER`.
+Key env vars: `PIPELINE_TARGET_FOLDER`, `HTTP_CONNECT_TIMEOUT`, `HTTP_READ_TIMEOUT`, `HTTP_MAX_RETRIES`.
 
 ## Troubleshooting
 
